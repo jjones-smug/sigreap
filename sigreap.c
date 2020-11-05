@@ -7,9 +7,21 @@
 #include <stdlib.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
+#include <syslog.h>
 #include <unistd.h>
 
-#define err(...) dprintf(STDERR_FILENO, __VA_ARGS__)
+#define LOG_TAG "SigReap"
+#define LOG_FLAGS LOG_PID | LOG_PERROR
+#define LOG_FACILITY LOG_LOCAL4
+
+#ifdef OUTPUT_TO_SYSLOG
+#	define err(...) syslog(LOG_ERR, __VA_ARGS__)
+#	define info(...) syslog(LOG_INFO, __VA_ARGS__)
+#else
+#	define err(...) dprintf(STDERR_FILENO, __VA_ARGS__)
+#	define info(...) dprintf(STDOUT_FILENO, __VA_ARGS__)
+#endif
+
 #define NMAXPIDS 64
 
 static pid_t childpids[NMAXPIDS+1];
@@ -18,7 +30,11 @@ static int lastexitcode;
 __attribute__((noreturn))
 static void die(const char *what) {
 	int e = errno;
+#ifdef OUTPUT_TO_SYSLOG
+	syslog(LOG_ERR, "%s", what);
+#else
 	perror(what);
+#endif
 	exit(-e);
 }
 
@@ -26,7 +42,7 @@ static inline void block() {
 	sigset_t all;
 	sigfillset(&all);
 	if (0 > sigprocmask(SIG_BLOCK, &all, NULL)) {
-		die("sigprocmask(SIG_BLOCK)");
+		die("action=exit reason=\"sigprocmask(SIG_BLOCK)\"");
 	}
 }
 
@@ -34,7 +50,7 @@ static inline void unblock() {
 	sigset_t all;
 	sigfillset(&all);
 	if (0 > sigprocmask(SIG_UNBLOCK, &all, NULL)) {
-		die("sigprocmask(SIG_UNBLOCK)");
+		die("action=exit reason=\"sigprocmask(SIG_UNBLOCK)\"");
 	}
 }
 
@@ -46,10 +62,10 @@ static void reap() {
 		wpid = waitpid(-1, &wstatus, WNOHANG | WUNTRACED | WCONTINUED);
 		if (0 < wpid) {
 			if (WIFSTOPPED(wstatus) || WIFCONTINUED(wstatus)) {
-				err(" child: %ld stop/cont\n", (long) wpid);
+				info("action=reap childPid=%ld reason=\"stop/cont\"\n", (long) wpid);
 			} else if (WIFEXITED(wstatus) || WIFSIGNALED(wstatus)) {
 				lastexitcode = WEXITSTATUS(wstatus);
-				err(" child: %ld exit/kill (%d)\n", (long) wpid, lastexitcode);
+				info("action=reap childPid=%ld reason=\"exit/kill\" exitCode=%d\n", (long) wpid, lastexitcode);
 			}
 		}
 	} while (0 < wpid);
@@ -66,13 +82,13 @@ static bool active(const char *procfs) {
 
 	cfd = open(procfs, O_RDONLY);
 	if (0 > cfd) {
-		die("open(procfs)");
+		die("action=exit reason=\"open(procfs)\"");
 	}
 	siz = read(cfd, &children, sizeof(children)-1);
 	close(cfd);
 
 	if (1 > siz) {
-		err("active: false\n");
+		err("action=unblock reason=\"no children\"\n");
 		unblock();
 		return false;
 	}
@@ -84,9 +100,9 @@ static bool active(const char *procfs) {
 	}
 	childpids[i] = 0;
 
-	err("active: true (%d: %s)\n", i, children);
+	info("childNumber=%d children=\"%s\"\n", i, children);
 	if (i >= NMAXPIDS) {
-		err("active: too many children (>NMAXPIDS)!\n");
+		err("action=ignoreChildren reasion=\"too many children (>NMAXPIDS)!\"\n");
 	}
 	unblock();
 
@@ -94,7 +110,7 @@ static bool active(const char *procfs) {
 }
 
 static void handler(int signo) {
-	err("signal: %d\n", signo); /* yes, this is not async-signal-safe */
+	info("action=handleSignal signal=%d\n", signo); /* yes, this is not async-signal-safe */
 	if (signo != SIGCHLD) {
 		for (int i = 0; i < NMAXPIDS && childpids[i]; ++i) {
 			if (0 > kill(childpids[i], signo)) {
@@ -121,7 +137,7 @@ static void setup(pid_t child) {
 	}
 
 	if (0 > prctl(PR_SET_CHILD_SUBREAPER, 1)) {
-		die("prctl(SET_CHILD_SUBREAPER)");
+		die("action=exit reason=\"prctl(SET_CHILD_SUBREAPER)\"");
 	}
 }
 
@@ -133,7 +149,7 @@ static void loop() {
 	switch (siz) {
 	case -1:
 	case PATH_MAX:
-		die("snprintf(/proc/.../children)");
+		die("action=exit reason=\"snprintf(/proc/.../children)\"");
 	}
 
 	while (active(procfs)) {
@@ -150,6 +166,8 @@ int main(int argc, char *argv[]) {
 		exit(EXIT_FAILURE);
 	}
 
+	openlog(LOG_TAG, LOG_FLAGS, LOG_FACILITY);
+
 	block();
 
 	switch ((child = fork())) {
@@ -157,13 +175,13 @@ int main(int argc, char *argv[]) {
 		unblock();
 		execvp(argv[1], &argv[1]); /* fallthrough */
 	case -1:
-		die("fork/exec");
+		die("action=exit reason=\"fork/exec\"");
 
 	default:
 		setup(child);
 		unblock();
 		loop();
 		errno = lastexitcode;
-		die("  done");
+		die("action=exit reason=done");
 	}
 }

@@ -1,4 +1,4 @@
-CC = gcc -Wall -g
+CC = gcc -Wall -g -D OUTPUT_TO_SYSLOG
 LDFLAGS =
 
 default :
